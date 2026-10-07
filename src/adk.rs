@@ -5,7 +5,10 @@ use adk_rust::{
     model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig},
     runner::{Runner, RunnerConfigBuilder},
     serde_json::json,
-    session::{AppendEventRequest, CreateRequest, Event, GetRequest, InMemorySessionService, SessionService},
+    session::{
+        AppendEventRequest, CreateRequest, Event, GetRequest, InMemorySessionService,
+        SessionService,
+    },
     tool::FunctionTool,
 };
 
@@ -20,20 +23,20 @@ use std::{
 const DEFAULT_INSTRUCTION: &str = "You are a helpful assistant.";
 const APP_NAME: &str = "chatbot";
 const ROOM_CONTEXT_SESSION_ID: &str = "room-context";
-const COLLABORATION_PROTOCOL: &str = r#"When you receive a chat message, first inspect the known participant introductions 
-    with the get_known_introductions tool before deciding whether to answer yourself or collaborate. Use those introductions 
+const COLLABORATION_PROTOCOL: &str = r#"When you receive a chat message, first inspect the known participant introductions
+    with the get_known_introductions tool before deciding whether to answer yourself or collaborate. Use those introductions
     to judge who is best suited for the task.
-    
+
     If you are asked to introduce yourself, use the introduce_yourself tool and return only its result, nothing more. Do not mention anyone then!
-    
-    You may receive a task context block containing task_id, requester, sender, room_id, and the original message. Keep the task_id stable across 
+
+    You may receive a task context block containing task_id, requester, sender, room_id, and the original message. Keep the task_id stable across
     all collaboration messages.
-    
-    If another participant is better suited or collaboration is needed, respond with a message that includes `[Task: <task_id>]` and mention collaborators 
+
+    If another participant is better suited or collaboration is needed, respond with a message that includes `[Task: <task_id>]` and mention collaborators
     as `@[Agent-Name]`.
-    
+
     If you complete the task yourself, include `[TaskComplete: <task_id>]` in your reply. When a requester is provided in the context, also include `[Requester: <requester_user_id>]`.
-    
+
     Do not invent collaborators. Base delegation decisions on known introductions.
 
     Never, and I mean never, use your own name in your responses or mention yourself. Always refer to yourself as 'I' or 'me'.
@@ -321,11 +324,7 @@ impl AdkOpenAiAgent {
         let session_id = SessionId::new(ROOM_CONTEXT_SESSION_ID)?;
         self.load_or_create_session(&user_id, &session_id).await?;
 
-        let identity = AdkIdentity::new(
-            AppName::new(APP_NAME)?,
-            user_id,
-            session_id,
-        );
+        let identity = AdkIdentity::new(AppName::new(APP_NAME)?, user_id, session_id);
 
         let mut event = Event::new("matrix-observed-message");
         event.author = "user".to_string();
@@ -356,7 +355,7 @@ impl AdkOpenAiAgent {
             {
                 Ok(_) => {}
                 Err(err) => {
-                    if err.to_string().contains("session not found") {
+                    if err.to_string().contains("session.not_found") {
                         self.session_service
                             .create(CreateRequest {
                                 app_name: APP_NAME.to_string(),
@@ -493,7 +492,13 @@ async fn fetch_response_text(
     while let Some(response) = stream.next().await {
         match response {
             Ok(event) => {
-                if let Some(content) = event.content() {
+                // Streaming responses contain text deltas on partial events. Some
+                // providers also emit the completed text on a terminal event; do
+                // not append that snapshot after already collecting the deltas.
+                let accept_text = event.llm_response.partial || response_text.is_empty();
+                if let Some(content) = event.content()
+                    && accept_text
+                {
                     for part in &content.parts {
                         if let Part::Text { text } = part
                             && !text.is_empty()

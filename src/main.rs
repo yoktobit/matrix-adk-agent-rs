@@ -20,7 +20,11 @@
 
 use std::sync::Arc;
 
-use crate::{adk::{AdkOpenAiAgent, AdkOpenAiAgentConfig}, matrix::{MatrixAgent, MatrixAgentConfig}, matrix_adk_agent::MatrixAdkAgent};
+use crate::{
+    adk::{AdkOpenAiAgent, AdkOpenAiAgentConfig},
+    matrix::{MatrixAgent, MatrixAgentConfig},
+    matrix_adk_agent::MatrixAdkAgent,
+};
 
 pub mod adk;
 pub mod matrix;
@@ -29,14 +33,14 @@ pub mod matrix_adk_agent;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    
+
     let ai_agent = AdkOpenAiAgent::new(AdkOpenAiAgentConfig::default_from_env()?).await?;
     //.with_introduction("I am a kind person that will answer as a really intelligent person that is always right, i will challenge your thoughts, I will always try to find valid sources for my meanings. And talking like yoda I do.".to_string())).await?;
-    
+
     let matrix_agent = MatrixAgent::new(MatrixAgentConfig::default_from_env()?).await?;
-    let matrix_adk_agent = Arc::new(MatrixAdkAgent::new(matrix_agent, ai_agent, true));
+    let matrix_adk_agent = Arc::new(MatrixAdkAgent::new(matrix_agent, ai_agent, true)?);
     matrix_adk_agent.connect_matrix().await?;
     matrix_adk_agent.run().await?;
-    
+
     Ok(())
 }

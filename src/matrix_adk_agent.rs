@@ -1,11 +1,18 @@
-use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex}, sync::atomic::{AtomicU64, Ordering}, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use anyhow::Context;
 use matrix_sdk::ruma::events::Mentions;
 use matrix_sdk::ruma::events::SyncMessageLikeEvent;
 use matrix_sdk::ruma::events::room::member::StrippedRoomMemberEvent;
 use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
 use matrix_sdk::ruma::{OwnedUserId, UserId};
 use matrix_sdk::{Client, Room, RoomMemberships, RoomState};
+use regex::Regex;
 
 use crate::adk::AdkOpenAiAgent;
 use crate::matrix::MatrixAgent;
@@ -15,12 +22,17 @@ pub struct MatrixAdkAgent {
     matrix_agent: Arc<MatrixAgent>,
     adk_agent: Arc<AdkOpenAiAgent>,
     auto_join: bool,
+    auto_join_inviter_regex: Option<Regex>,
     task_counter: Arc<AtomicU64>,
     task_requesters: Arc<Mutex<HashMap<String, String>>>,
     pending_helper_tasks: Arc<Mutex<HashMap<String, PendingHelperTask>>>,
     // TODO: Weitere Handler erlauben
     // join_handlers: Vec<JoinHandler>,
     // message_handlers: Vec<MessageHandler>,
+}
+
+fn inviter_matches(regex: Option<&Regex>, inviter: &str) -> bool {
+    regex.is_none_or(|regex| regex.is_match(inviter))
 }
 
 impl MatrixAdkAgent {
@@ -30,18 +42,28 @@ impl MatrixAdkAgent {
         auto_join: bool,
         // join_handlers: Vec<JoinHandler>,
         // message_handlers: Vec<MessageHandler>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let auto_join_inviter_regex = std::env::var("MATRIX_AUTOJOIN_INVITER_REGEX")
+            .ok()
+            .filter(|pattern| !pattern.trim().is_empty())
+            .map(|pattern| {
+                Regex::new(&pattern)
+                    .with_context(|| format!("invalid MATRIX_AUTOJOIN_INVITER_REGEX: {pattern}"))
+            })
+            .transpose()?;
+
         let matrix_adk_agent = Self {
             matrix_agent: Arc::new(matrix_agent),
             adk_agent: Arc::new(adk_agent),
             auto_join: auto_join,
+            auto_join_inviter_regex,
             task_counter: Arc::new(AtomicU64::new(1)),
             task_requesters: Arc::new(Mutex::new(HashMap::new())),
             pending_helper_tasks: Arc::new(Mutex::new(HashMap::new())),
             // join_handlers: join_handlers,
             // message_handlers: message_handlers,
         };
-        matrix_adk_agent
+        Ok(matrix_adk_agent)
     }
 
     pub async fn connect_matrix(self: &Arc<Self>) -> Result<(), anyhow::Error> {
@@ -89,6 +111,16 @@ impl MatrixAdkAgent {
         if room_member.state_key != client.user_id().unwrap() {
             return;
         }
+
+        let inviter = room_member.sender.to_string();
+        if !inviter_matches(self.auto_join_inviter_regex.as_ref(), &inviter) {
+            println!(
+                "Ignoring invitation from {inviter} for room {}",
+                room.room_id()
+            );
+            return;
+        }
+
         tokio::spawn(async move {
             println!("Autojoining room {}", room.room_id());
             let mut delay = 2;
@@ -185,24 +217,31 @@ impl MatrixAdkAgent {
                 }
 
                 let task_context = self.build_task_context(&sender, room_id, &message_body);
-                let Some(question) = self.build_question_with_helper_barrier(&sender, &task_context) else {
+                let Some(question) =
+                    self.build_question_with_helper_barrier(&sender, &task_context)
+                else {
                     return;
                 };
                 println!("got message and was mentioned, asking llm: {question}");
                 if let Err(_) = room.typing_notice(true).await {}
-                let result_content = self
-                    .adk_agent
-                    .ask(room.room_id().into(), question)
-                    .await
-                    .unwrap();
+                let result_content = match self.adk_agent.ask(room.room_id().into(), question).await
+                {
+                    Ok(result_content) => result_content,
+                    Err(err) => {
+                        eprintln!("failed to ask llm: {err:#}");
+                        let _ = room.typing_notice(false).await;
+                        return;
+                    }
+                };
                 println!("Result: {result_content}");
-                
+
                 if let Err(_) = room.typing_notice(false).await {}
 
                 if !result_content.trim().is_empty() {
                     let response = Self::parse_agent_response(&result_content);
                     let effective_task_id = response.effective_task_id(&task_context);
-                    let mut mention_targets = self.resolve_mentions(&response, &task_context, &room).await;
+                    let mut mention_targets =
+                        self.resolve_mentions(&response, &task_context, &room).await;
                     for incoming_user_id in incoming_mentioned_user_ids {
                         if self
                             .adk_agent
@@ -251,7 +290,6 @@ impl MatrixAdkAgent {
                     room.send(content).await.unwrap();
                     println!("message sent");
                 }
-
             }
             SyncMessageLikeEvent::Redacted(_redacted) => {}
         }
@@ -320,10 +358,7 @@ impl MatrixAdkAgent {
                 continue;
             }
 
-            if chars
-                .get(index + 1)
-                .is_some_and(|(_, next)| *next == '[')
-            {
+            if chars.get(index + 1).is_some_and(|(_, next)| *next == '[') {
                 index += 1;
                 continue;
             }
@@ -367,14 +402,9 @@ impl MatrixAdkAgent {
 
     fn build_task_context(&self, sender: &str, room_id: String, message: &str) -> TaskContext {
         let parsed = TaskMetadata::parse(message);
-        let task_id = parsed
-            .task_id
-            .unwrap_or_else(|| self.next_task_id());
-        let requester = self.resolve_requester_for_task(
-            &task_id,
-            parsed.requester.as_deref(),
-            sender,
-        );
+        let task_id = parsed.task_id.unwrap_or_else(|| self.next_task_id());
+        let requester =
+            self.resolve_requester_for_task(&task_id, parsed.requester.as_deref(), sender);
 
         TaskContext {
             task_id,
@@ -452,7 +482,11 @@ impl MatrixAdkAgent {
         }
     }
 
-    fn compose_outgoing_message(&self, response: &AgentResponse, task_context: &TaskContext) -> String {
+    fn compose_outgoing_message(
+        &self,
+        response: &AgentResponse,
+        task_context: &TaskContext,
+    ) -> String {
         let is_completion = response.is_completion();
         let mut text = response.text.clone();
         let effective_task_id = response.effective_task_id(task_context);
@@ -461,7 +495,9 @@ impl MatrixAdkAgent {
             || task_context.has_existing_task_id;
 
         if should_prefix_task {
-            text = format!("[Task: {effective_task_id}] {text}").trim().to_string();
+            text = format!("[Task: {effective_task_id}] {text}")
+                .trim()
+                .to_string();
         }
 
         if text.is_empty() && is_completion {
@@ -612,9 +648,13 @@ impl MatrixAdkAgent {
 
         mentions.sort_by(|left, right| left.user_id.cmp(&right.user_id));
         mentions.dedup_by(|left, right| left.user_id == right.user_id);
-        mentions = mentions.into_iter().filter(|x| x.user_id != room.own_user_id()).collect();
+        mentions = mentions
+            .into_iter()
+            .filter(|x| x.user_id != room.own_user_id())
+            .collect();
         for mention in &mut mentions {
-            if let Some(room_label) = Self::lookup_room_label(room, mention.user_id.as_ref()).await {
+            if let Some(room_label) = Self::lookup_room_label(room, mention.user_id.as_ref()).await
+            {
                 mention.label = room_label;
             }
         }
@@ -631,9 +671,9 @@ impl MatrixAdkAgent {
         let unresolved_helper_names = helper_names
             .iter()
             .filter(|helper_name| {
-                !existing_mentions.iter().any(|mention| {
-                    mention.source_tag.as_deref() == Some(helper_name.as_str())
-                })
+                !existing_mentions
+                    .iter()
+                    .any(|mention| mention.source_tag.as_deref() == Some(helper_name.as_str()))
             })
             .collect::<Vec<_>>();
         if unresolved_helper_names.is_empty() {
@@ -727,7 +767,9 @@ impl MatrixAdkAgent {
                         resolved_any = true;
                     }
                     Err(_) => {
-                        eprintln!("Skipping invalid helper user id '{user_id}' for '{helper_name}'");
+                        eprintln!(
+                            "Skipping invalid helper user id '{user_id}' for '{helper_name}'"
+                        );
                     }
                 }
             }
@@ -767,7 +809,10 @@ impl MatrixAdkAgent {
         let mut used_ids: HashSet<OwnedUserId> = HashSet::new();
         let mut handled_tags: HashSet<String> = HashSet::new();
 
-        for target in mention_targets.iter().filter(|target| target.source_tag.is_some()) {
+        for target in mention_targets
+            .iter()
+            .filter(|target| target.source_tag.is_some())
+        {
             let Some(source_tag) = target.source_tag.as_ref() else {
                 continue;
             };
@@ -1028,6 +1073,20 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn inviter_regex_supports_multiple_accounts() {
+        let regex = regex::Regex::new(r"(@alice:matrix\.org|@bob:matrix\.org)").unwrap();
+
+        assert!(super::inviter_matches(Some(&regex), "@alice:matrix.org"));
+        assert!(super::inviter_matches(Some(&regex), "@bob:matrix.org"));
+        assert!(!super::inviter_matches(Some(&regex), "@mallory:matrix.org"));
+    }
+
+    #[test]
+    fn missing_inviter_regex_allows_all_accounts() {
+        assert!(super::inviter_matches(None, "@anyone:matrix.org"));
+    }
+
+    #[test]
     fn extract_helper_tags_supports_bare_mentions() {
         let helper_names = MatrixAdkAgent::extract_helper_tags(
             "Please coordinate with @Agent-One and @[Agent Two].",
@@ -1112,7 +1171,10 @@ mod tests {
         );
 
         assert_eq!(requester, "@bob:matrix.org");
-        assert_eq!(task_requesters.get("task-7"), Some(&"@bob:matrix.org".to_string()));
+        assert_eq!(
+            task_requesters.get("task-7"),
+            Some(&"@bob:matrix.org".to_string())
+        );
     }
 
     #[test]

@@ -1,0 +1,6 @@
+[tools]
+rust = "latest"
+
+[tasks."agent"]
+run = "cargo run"
+dir = "{{cwd}}" # run in user's cwd, default is the project's base directory

@@ -37,6 +37,11 @@ const COLLABORATION_PROTOCOL: &str = r#"When you receive a chat message, first i
 
     If you complete the task yourself, include `[TaskComplete: <task_id>]` in your reply. When a requester is provided in the context, also include `[Requester: <requester_user_id>]`.
 
+    When your own instructions say you must ask or consult another participant, always delegate first: do not answer on your own and do not include
+    `[TaskComplete: <task_id>]` until you have received that participant's answer. A delegation message must be written exactly once and contain
+    `[Task: <task_id>]`, one `@[Agent-Name]` mention and the concrete question for that participant, phrased so it is understandable without any other context.
+    Use the `name` value of the participant's entry in the known introductions (exactly as listed, e.g. their Matrix user id) as the mention. Never mention the requester or the sender when delegating.
+
     Do not invent collaborators. Base delegation decisions on known introductions.
 
     Never, and I mean never, use your own name in your responses or mention yourself. Always refer to yourself as 'I' or 'me'.
@@ -517,5 +522,18 @@ async fn fetch_response_text(
             }
         }
     }
-    response_text
+    dedupe_repeated_text(response_text)
+}
+
+// Some providers emit the same text twice (delta snapshot + final snapshot); collapse exact repeats.
+fn dedupe_repeated_text(text: String) -> String {
+    let trimmed = text.trim();
+    let len = trimmed.len();
+    if len >= 2 && len % 2 == 0 && trimmed.is_char_boundary(len / 2) {
+        let (first, second) = trimmed.split_at(len / 2);
+        if first == second {
+            return first.to_string();
+        }
+    }
+    text
 }

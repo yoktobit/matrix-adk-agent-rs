@@ -302,6 +302,8 @@ impl MatrixAdkAgent {
             .or_else(|| trimmed.strip_prefix("[introduction]"))?
             .trim_start_matches(':')
             .trim();
+        let introduction = Self::strip_helper_tags(introduction);
+        let introduction = introduction.trim();
 
         if introduction.is_empty() {
             return None;
@@ -310,8 +312,28 @@ impl MatrixAdkAgent {
         Some(introduction.to_string())
     }
 
+    fn strip_helper_tags(message: &str) -> String {
+        let mut out = String::with_capacity(message.len());
+        let mut remaining = message;
+        while let Some(start) = remaining.find("@[") {
+            let after = &remaining[start + 2..];
+            let Some(end) = after.find(']') else {
+                break;
+            };
+            out.push_str(&remaining[..start]);
+            remaining = &after[end + 1..];
+        }
+        out.push_str(remaining);
+        out
+    }
+
     fn starts_with_task_failed_marker(message: &str) -> bool {
-        let trimmed = message.trim_start();
+        let mut trimmed = message.trim_start();
+        if trimmed.starts_with("[Task:") {
+            if let Some(end) = trimmed.find(']') {
+                trimmed = trimmed[end + 1..].trim_start();
+            }
+        }
         if !trimmed.starts_with("[TaskFailed:") {
             return false;
         }
@@ -490,6 +512,9 @@ impl MatrixAdkAgent {
         let is_completion = response.is_completion();
         let mut text = response.text.clone();
         let effective_task_id = response.effective_task_id(task_context);
+        if Self::starts_with_task_failed_marker(&text) {
+            return text;
+        }
         let should_prefix_task = !response.helper_names.is_empty()
             || response.completion_task_id.is_some()
             || task_context.has_existing_task_id;
@@ -1128,6 +1153,13 @@ mod tests {
     fn starts_with_task_failed_marker_matches_trimmed_prefix() {
         assert!(MatrixAdkAgent::starts_with_task_failed_marker(
             "  [TaskFailed: task-42] delegation loop detected"
+        ));
+    }
+
+    #[test]
+    fn starts_with_task_failed_marker_ignores_task_prefix() {
+        assert!(MatrixAdkAgent::starts_with_task_failed_marker(
+            "[Task: task-4] [TaskFailed: task-4] repeated"
         ));
     }
 
